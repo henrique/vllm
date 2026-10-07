@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Iterable
-from typing import ClassVar, Literal
+from typing import ClassVar, Literal, Union
 
 import torch
 from torch import nn
@@ -771,10 +771,18 @@ class Glm5NextModel(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
-            # post/comb (deferred mHC hc_post state) are not propagated across
-            # PP ranks; the receiving rank's first mHC layer uses standalone pre.
-            post = None
-            comb = None
+            # Propagate the deferred mHC hc_post state (post/comb) across the
+            # PP boundary. With config.mhc=True every layer runs the mHC
+            # branch and post/comb flow between all consecutive layer pairs;
+            # post is None only at layer 0. Dropping them (the previous
+            # behavior) made the receiving rank's first layer take the
+            # ``post is None`` path with ``layer_idx != 0``, which skips
+            # hc_expand and feeds a 2D residual to the mHC kernel (shape
+            # assert). Carrying them keeps the math identical to co-located
+            # layers: the first layer runs the same fused hc_fused_post_pre
+            # it would run without PP.
+            post = intermediate_tensors.tensors.get("post")
+            comb = intermediate_tensors.tensors.get("comb")
 
         full_num_tokens = positions.shape[0]
         if self.is_sequence_parallel:
@@ -786,20 +794,67 @@ class Glm5NextModel(nn.Module):
             )
 
         if not get_pp_group().is_last_rank:
-            # PP is gated off for GLM-5.3-Flash (no make_empty_intermediate_tensors),
-            # so this branch is not exercised. post/comb are the deferred
-            # hc_post state of this rank's last mHC layer; a future PP path
-            # would need to propagate them, but for now they are dropped (the
-            # receiving rank's first layer would fall back to standalone pre).
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
+            # Include the deferred mHC hc_post state (post/comb) in the
+            # boundary exchange so the next rank's first layer can run the
+            # fused hc_fused_post_pre path (see the receive side above). The
+            # V1 PP exchange (send_tensor_dict / irecv_tensor_dict) is
+            # key-generic, so the extra keys just ride along.
+            # post: [s, n, 1] fp32, comb: [s, n, n] fp32.
+            tensors = {
+                "hidden_states": hidden_states,
+                "residual": residual,
+            }
+            if post is not None:
+                tensors["post"] = post
+            if comb is not None:
+                tensors["comb"] = comb
+            return IntermediateTensors(tensors)
 
         if self.is_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
 
         hidden_states = self.norm(hidden_states)
         return hidden_states
+
+    def make_empty_intermediate_tensors(
+        self,
+        batch_size: int,
+        dtype: torch.dtype,
+        device: Union[str, torch.device],
+    ) -> IntermediateTensors:
+        # mHC is model-wide (config.mhc=True): every layer runs the mHC
+        # branch, so the boundary state is always the 4-tuple below.
+        # post/comb are fp32 mix coefficients produced by the mHC kernels
+        # (mhc_pre / mhc_fused_post_pre return fp32), NOT the model dtype.
+        if self.config.mhc:
+            n = self.config.hc_mult
+            hidden = self.config.hidden_size
+            return IntermediateTensors(
+                {
+                    "hidden_states": torch.zeros(
+                        (batch_size, hidden), dtype=dtype, device=device
+                    ),
+                    "residual": torch.zeros(
+                        (batch_size, n, hidden), dtype=dtype, device=device
+                    ),
+                    "post": torch.zeros(
+                        (batch_size, n, 1), dtype=torch.float32, device=device
+                    ),
+                    "comb": torch.zeros(
+                        (batch_size, n, n), dtype=torch.float32, device=device
+                    ),
+                }
+            )
+        return IntermediateTensors(
+            {
+                "hidden_states": torch.zeros(
+                    (batch_size, self.config.hidden_size), dtype=dtype, device=device
+                ),
+                "residual": torch.zeros(
+                    (batch_size, self.config.hidden_size), dtype=dtype, device=device
+                ),
+            }
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
@@ -1013,6 +1068,16 @@ class Glm5NextForCausalLM(
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
+    def make_empty_intermediate_tensors(
+        self,
+        batch_size: int,
+        dtype: torch.dtype,
+        device: Union[str, torch.device],
+    ) -> IntermediateTensors:
+        return self.model.make_empty_intermediate_tensors(
+            batch_size, dtype, device
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -1166,9 +1231,15 @@ class Glm5NextForConditionalGeneration(
 
         self.set_moe_parameters()
 
-        # Glm5NextForCausalLM does not implement make_empty_intermediate_tensors,
-        # so pipeline parallelism is gated off (consistent with the text-only
-        # model) and we intentionally do not alias it here.
+    def make_empty_intermediate_tensors(
+        self,
+        batch_size: int,
+        dtype: torch.dtype,
+        device: Union[str, torch.device],
+    ) -> IntermediateTensors:
+        return self.language_model.make_empty_intermediate_tensors(
+            batch_size, dtype, device
+        )
 
     def set_moe_parameters(self) -> None:
         self.moe_mlp_layers = [
@@ -1252,6 +1323,12 @@ def _try_load_fp8_indexer_wk(name, tensor, buf, params_dict, loaded_params):
     )
 
     fused_name = f"{layer_prefix}.wk_weights_proj.weight"
+    # PP guard: only the rank that owns this layer has the fused param.
+    if fused_name not in params_dict:
+        # Discard the buffered tensors so they don't linger; the owning
+        # rank will load and dequantize them.
+        buf.pop(layer_prefix, None)
+        return True
     param = params_dict[fused_name]
     param.weight_loader(param, weight_bf16, 0)
     loaded_params.add(fused_name)
@@ -1354,6 +1431,10 @@ def _try_load_fp8_attn_proj(
         )
         weight_bf16 = torch.cat([weight_bf16, pad], dim=0)
 
+    # PP guard: only the rank that owns this layer has the target param.
+    if target_w not in params_dict:
+        buf[layer_prefix].pop(key, None)
+        return True
     param = params_dict[target_w]
     if shard_id is None:
         param.weight_loader(param, weight_bf16)

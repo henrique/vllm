@@ -145,6 +145,10 @@ TEXT_GENERATION_MODELS = {
     "stabilityai/stablelm-3b-4e1t": PPTestSettings.fast(),
     "bigcode/starcoder2-3b": PPTestSettings.fast(),
     "upstage/solar-pro-preview-instruct": PPTestSettings.fast(load_format="dummy"),
+    # GLM-5.3-Flash: hybrid mHC (hyper-connections) + MoE. Tests the mHC
+    # post/comb state propagation across PP boundaries and the FP8 loader
+    # PP ownership guards. Uses dummy weights (the real checkpoint is ~306 GiB).
+    "zai-org/GLM-5.3-Flash": PPTestSettings.fast(load_format="dummy"),
     # [Encoder-only]
     # TODO: Implement PP
     # "facebook/bart-base": PPTestSettings.fast(),
