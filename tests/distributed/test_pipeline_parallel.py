@@ -145,6 +145,7 @@ TEXT_GENERATION_MODELS = {
     "stabilityai/stablelm-3b-4e1t": PPTestSettings.fast(),
     "bigcode/starcoder2-3b": PPTestSettings.fast(),
     "upstage/solar-pro-preview-instruct": PPTestSettings.fast(load_format="dummy"),
+    "zai-org/GLM-5.3-Flash": PPTestSettings.fast(load_format="dummy"),
     # [Encoder-only]
     # TODO: Implement PP
     # "facebook/bart-base": PPTestSettings.fast(),
@@ -196,6 +197,8 @@ TEST_MODELS = [
     "fixie-ai/ultravox-v0_5-llama-3_2-1b",
     # [LANGUAGE GENERATION - HYBRID ARCH]
     "ai21labs/Jamba-tiny-dev",
+    # Hybrid KDA+MLA model for PP testing
+    "zai-org/GLM-5.3-Flash",
 ]
 
 

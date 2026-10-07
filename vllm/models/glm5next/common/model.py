@@ -786,10 +786,9 @@ class Glm5NextModel(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
-            # post/comb (deferred mHC hc_post state) are not propagated across
-            # PP ranks; the receiving rank's first mHC layer uses standalone pre.
-            post = None
-            comb = None
+            # Propagate mHC post/comb state across the PP boundary.
+            post = intermediate_tensors.tensors.get("post")
+            comb = intermediate_tensors.tensors.get("comb")
 
         full_num_tokens = positions.shape[0]
         if self.is_sequence_parallel:
@@ -801,20 +800,59 @@ class Glm5NextModel(nn.Module):
             )
 
         if not get_pp_group().is_last_rank:
-            # PP is gated off for GLM-5.3-Flash (no make_empty_intermediate_tensors),
-            # so this branch is not exercised. post/comb are the deferred
-            # hc_post state of this rank's last mHC layer; a future PP path
-            # would need to propagate them, but for now they are dropped (the
-            # receiving rank's first layer would fall back to standalone pre).
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
+            # Send post/comb so the next rank's first layer runs fused hc_post_pre.
+            tensors = {
+                "hidden_states": hidden_states,
+                "residual": residual,
+            }
+            if post is not None:
+                tensors["post"] = post
+            if comb is not None:
+                tensors["comb"] = comb
+            return IntermediateTensors(tensors)
 
         if self.is_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
 
         hidden_states = self.norm(hidden_states)
         return hidden_states
+
+    def make_empty_intermediate_tensors(
+        self,
+        batch_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> IntermediateTensors:
+        # mHC: boundary state is 4-tuple; post/comb are fp32, not model dtype.
+        if self.config.mhc:
+            n = self.config.hc_mult
+            hidden = self.config.hidden_size
+            return IntermediateTensors(
+                {
+                    "hidden_states": torch.zeros(
+                        (batch_size, hidden), dtype=dtype, device=device
+                    ),
+                    "residual": torch.zeros(
+                        (batch_size, n, hidden), dtype=dtype, device=device
+                    ),
+                    "post": torch.zeros(
+                        (batch_size, n, 1), dtype=torch.float32, device=device
+                    ),
+                    "comb": torch.zeros(
+                        (batch_size, n, n), dtype=torch.float32, device=device
+                    ),
+                }
+            )
+        return IntermediateTensors(
+            {
+                "hidden_states": torch.zeros(
+                    (batch_size, self.config.hidden_size), dtype=dtype, device=device
+                ),
+                "residual": torch.zeros(
+                    (batch_size, self.config.hidden_size), dtype=dtype, device=device
+                ),
+            }
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
@@ -1033,6 +1071,16 @@ class Glm5NextForCausalLM(
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
+    def make_empty_intermediate_tensors(
+        self,
+        batch_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> IntermediateTensors:
+        return self.model.make_empty_intermediate_tensors(
+            batch_size, dtype, device
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -1186,9 +1234,15 @@ class Glm5NextForConditionalGeneration(
 
         self.set_moe_parameters()
 
-        # Glm5NextForCausalLM does not implement make_empty_intermediate_tensors,
-        # so pipeline parallelism is gated off (consistent with the text-only
-        # model) and we intentionally do not alias it here.
+    def make_empty_intermediate_tensors(
+        self,
+        batch_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> IntermediateTensors:
+        return self.language_model.make_empty_intermediate_tensors(
+            batch_size, dtype, device
+        )
 
     def set_moe_parameters(self) -> None:
         self.moe_mlp_layers = [
@@ -1331,6 +1385,10 @@ def _try_load_fp8_indexer_wk(name, tensor, buf, params_dict, loaded_params):
     )
 
     fused_name = f"{layer_prefix}.wk_weights_proj.weight"
+    # PP guard: only the owning rank has the fused param.
+    if fused_name not in params_dict:
+        buf.pop(layer_prefix, None)
+        return True
     param = params_dict[fused_name]
     param.weight_loader(param, weight_bf16, 0)
     loaded_params.add(fused_name)
@@ -1433,6 +1491,10 @@ def _try_load_fp8_attn_proj(
         )
         weight_bf16 = torch.cat([weight_bf16, pad], dim=0)
 
+    # PP guard: only the rank that owns this layer has the target param.
+    if target_w not in params_dict:
+        buf[layer_prefix].pop(key, None)
+        return True
     param = params_dict[target_w]
     if shard_id is None:
         param.weight_loader(param, weight_bf16)

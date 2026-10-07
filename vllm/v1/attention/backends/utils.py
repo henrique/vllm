@@ -282,10 +282,26 @@ def resolve_kv_cache_layout(
     assert supported_layouts and all(supported_layouts), (
         "No worker reported supported KV cache layouts."
     )
-    assert all(names == supported_layouts[0] for names in supported_layouts[1:]), (
-        f"Workers disagree on supported KV cache layouts: {supported_layouts}."
-    )
-    candidates = [_layout_from_name(name) for name in supported_layouts[0]]
+    # With PP, workers may report different supported layouts.
+    # Intersect across workers, keeping the most-preferred order.
+    first = supported_layouts[0]
+    if all(names == first for names in supported_layouts[1:]):
+        candidates = [_layout_from_name(name) for name in first]
+    else:
+        priorities: dict[KVCacheLayout, int] = defaultdict(int)
+        for preferred_name, *_ in supported_layouts:
+            priorities[_layout_from_name(preferred_name)] += 1
+        common = set.intersection(*map(set, supported_layouts))
+        candidates = sorted(
+            (layout for layout in KVCacheLayout if layout.name in common),
+            key=lambda layout: priorities[layout],
+            reverse=True,
+        )
+        if not candidates:
+            raise ValueError(
+                "No KV cache layout satisfies every worker's supported set: "
+                f"{supported_layouts}."
+            )
 
     # A block-compact layout means the block is densely packed in memory, so any mix of
     # specs can re-interpret HNC with different sizes as long as the total number of

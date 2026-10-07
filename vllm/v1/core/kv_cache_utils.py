@@ -1290,6 +1290,27 @@ def _get_kv_cache_groups_glm5_next(
         assert tail_uniform is not None
         tail_group = KVCacheGroupSpec(list(padded_tail_specs), tail_uniform)
 
+    # With PP, KDA-only workers skip the hybrid block-size alignment, so
+    # normalize all MambaSpecs to the aligned values (max block_size).
+    max_block_size = max(spec.block_size for spec in mamba_specs.values())
+    aligned_padded = next(
+        (
+            spec.page_size_padded
+            for spec in mamba_specs.values()
+            if spec.block_size == max_block_size
+            and spec.page_size_padded is not None
+        ),
+        None,
+    )
+    assert aligned_padded is not None, (
+        "No MambaSpec has both max block_size and a page_size_padded"
+    )
+    mamba_specs = {
+        name: replace(spec, block_size=max_block_size, page_size_padded=aligned_padded)
+        if spec.block_size != max_block_size or spec.page_size_padded is None
+        else spec
+        for name, spec in mamba_specs.items()
+    }
     any_mamba = next(iter(mamba_specs.values()))
     assert all(spec == any_mamba for spec in mamba_specs.values())
     if any_mamba.real_page_size_bytes > mla_page:

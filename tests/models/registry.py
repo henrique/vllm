@@ -285,7 +285,17 @@ _TEXT_GENERATION_EXAMPLE_MODELS = {
         "zai-org/GLM-4.7-Flash",
     ),
     "GlmMoeDsaForCausalLM": _HfExamplesInfo("zai-org/GLM-5", is_available_online=False),
-    "Glm5NextForCausalLM": _HfExamplesInfo("zai-org/GLM-5.3-Flash"),
+    "Glm5NextForCausalLM": _HfExamplesInfo(
+        "zai-org/GLM-5.3-Flash",
+        # Nested text_config overrides: 8 layers (two KDA+MLA cycles) for PP,
+        # shrunk n_routed_experts to avoid OOM.
+        hf_overrides={
+            "text_config": {
+                "num_hidden_layers": 8,
+                "n_routed_experts": 8,
+            }
+        },
+    ),
     "GPT2LMHeadModel": _HfExamplesInfo("openai-community/gpt2"),
     "GPTBigCodeForCausalLM": _HfExamplesInfo(
         "bigcode/starcoder",
@@ -928,7 +938,17 @@ _MULTIMODAL_EXAMPLE_MODELS = {
     "GlmOcrForConditionalGeneration": _HfExamplesInfo(
         "zai-org/GLM-OCR",
     ),
-    "Glm5NextForConditionalGeneration": _HfExamplesInfo("zai-org/GLM-5.3-Flash"),
+    "Glm5NextForConditionalGeneration": _HfExamplesInfo(
+        "zai-org/GLM-5.3-Flash",
+        # Nested text_config overrides: 8 layers (two KDA+MLA cycles) for PP,
+        # shrunk n_routed_experts to avoid OOM.
+        hf_overrides={
+            "text_config": {
+                "num_hidden_layers": 8,
+                "n_routed_experts": 8,
+            }
+        },
+    ),
     "H2OVLChatModel": _HfExamplesInfo(
         "h2oai/h2ovl-mississippi-800m",
         trust_remote_code=True,
